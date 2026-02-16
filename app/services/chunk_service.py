@@ -1,3 +1,6 @@
+from app.services.embedding_service import get_chroma_collection
+
+
 MAX_CHARS = 800
 OVERLAP_CHARS = 120
 
@@ -47,5 +50,34 @@ def chunk_sections(sections, document_id):
                     "difficulty": section.get("difficulty", "unknown")
                 })
                 chunk_id += 1
+
+    return chunks
+
+def get_chunks_for_document(document_id: str):
+    collection = get_chroma_collection()
+
+    results = collection.get(
+        where={
+            "$and": [
+                {"document_id": document_id},
+                {"type": "text"}
+            ]
+        }
+    )
+
+    chunks = []
+
+    for i in range(len(results["documents"])):
+        chunks.append({
+            "id": results["ids"][i],
+            "text": results["documents"][i],
+            "metadata": results["metadatas"][i]
+        })
+
+    # SORT BY PAGE
+    chunks = sorted(
+        chunks,
+        key=lambda x: x["metadata"].get("page", 0)
+    )
 
     return chunks

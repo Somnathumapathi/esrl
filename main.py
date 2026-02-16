@@ -1,6 +1,7 @@
 import os
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from app.services.pdf_service import (
     save_pdf,
     extract_text_from_pdf,
@@ -11,8 +12,9 @@ from app.services.pdf_service import (
 )
 from app.services.text_processing_service import clean_text, structure_pages
 from app.services.discourse_service import classify_discourse
-from app.services.chunk_service import chunk_sections
+from app.services.chunk_service import chunk_sections, get_chunks_for_document
 from app.services.embedding_service import (
+    get_images_for_document,
     upsert_chunks,
     upsert_images,
     query_similar,
@@ -23,8 +25,19 @@ from app.services.image_service import generate_caption, extract_text
 from app.services.rag_service import generate_answer
 from app.services.notes_service import generate_quick_notes
 from app.services.summarizer_service import summarize_text_levels
+from app.services.video_gen_service import generate_slide_plan, generate_voice, get_audio_duration, html_to_video, image_audio_to_video, normalize_chroma_images, render_slide_html, stitch_videos
+from dotenv import load_dotenv
+load_dotenv()
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 async def root():
@@ -148,3 +161,60 @@ async def notes_summary(payload: dict):
         full_text, _ = extract_text_from_pdf(pdf_path)
         text = clean_text(full_text)
     return summarize_text_levels(text)
+
+@app.post("/generate_video/{document_id}")
+async def generate_video(document_id: str):
+
+    text_chunks = get_chunks_for_document(document_id)
+    raw_images = get_images_for_document(document_id)
+    image_chunks = normalize_chroma_images(raw_images)
+
+
+    if not text_chunks:
+        return {"error": "No text chunks found for document"}
+
+    slides = generate_slide_plan(text_chunks, image_chunks)
+
+    # print(slides)
+
+    if not slides:
+        return {"error": "Slide generation failed"}
+
+    video_paths = []
+
+    for i, slide in enumerate(slides):
+        print(f"Generating slide {i+1}/{len(slides)}")
+
+        voice_text = slide.get("voiceover") or slide.get("explanation")
+
+        if not voice_text:
+            continue
+
+        audio_path = generate_voice(voice_text, i)
+        print(audio_path)
+        duration = get_audio_duration(audio_path)
+
+        # ⚠ IMPORTANT: pass image_chunks here
+        html_path = render_slide_html(
+            slide,
+            duration=5,
+            slide_id=i,
+            all_images=image_chunks
+        )
+
+        webm_path = await html_to_video(html_path, i, duration)
+        print("WEBM EXISTS:", os.path.exists(webm_path))
+        print("AUDIO EXISTS:", os.path.exists(audio_path))
+        video_path = image_audio_to_video(webm_path, audio_path, duration, i)
+        video_paths.append(video_path)
+
+    if not video_paths:
+        return {"error": "Video generation failed"}
+
+    final_video = stitch_videos(video_paths)
+
+    return {
+        "message": "Video generated successfully",
+        "video_path": final_video
+        # "slides": slides
+    }

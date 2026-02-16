@@ -1,1 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 .env
+venv/
+.env/
+media/
+storage/
+.DS_Store

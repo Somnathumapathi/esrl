@@ -12,4 +12,6 @@ spacy
 google-genai
 requests
 streamlit
+pydub
+playwright
 #jnbwrikhfbnke
