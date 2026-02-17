@@ -1,7 +1,8 @@
 import os
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from app.services.pdf_service import (
     save_pdf,
     extract_text_from_pdf,
@@ -22,7 +23,7 @@ from app.services.embedding_service import (
     get_text_for_page
 )
 from app.services.image_service import generate_caption, extract_text
-from app.services.rag_service import generate_answer
+from app.services.rag_service import generate_answer, generate_chat_answer
 from app.services.notes_service import generate_quick_notes
 from app.services.summarizer_service import summarize_text_levels
 from app.services.video_gen_service import generate_slide_plan, generate_voice, get_audio_duration, html_to_video, image_audio_to_video, normalize_chroma_images, render_slide_html, stitch_videos
@@ -30,6 +31,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI()
+
+app.mount("/media", StaticFiles(directory="media"), name="media")
+app.mount("/storage", StaticFiles(directory="storage"), name="storage")
 
 app.add_middleware(
     CORSMiddleware,
@@ -96,7 +100,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 
 @app.post("/rag")
-async def rag_query(payload: dict):
+async def rag_query(payload: dict, request: Request):
     query = payload.get("query", "")
     context = query_similar(query, top_k=8)
     answer = generate_answer(query, context)
@@ -117,8 +121,64 @@ async def rag_query(payload: dict):
                 page_docs = page_docs[0] if page_docs and isinstance(page_docs[0], list) else page_docs
                 if page_docs:
                     context_snippet = page_docs[0][:400]
+            image_path = meta.get("path")
             images.append({
-                "path": meta.get("path"),
+                "path": image_path,
+                "url": _build_file_url(request, image_path),
+                "caption": meta.get("caption") or doc or "Image",
+                "ocr": meta.get("ocr") or "",
+                "context": context_snippet,
+                "page": meta.get("page"),
+                "document_id": meta.get("document_id")
+            })
+    return {"answer": answer, "context": context, "images": images}
+
+
+@app.post("/chat")
+async def chat(payload: dict, request: Request):
+    messages = payload.get("messages")
+    if not messages:
+        query = (payload.get("query") or "").strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="No messages or query provided.")
+        messages = [{"role": "user", "content": query}]
+
+    last_user = next(
+        (
+            message
+            for message in reversed(messages)
+            if (message.get("role") or "").lower() == "user"
+            and (message.get("content") or "").strip()
+        ),
+        None,
+    )
+    if not last_user:
+        raise HTTPException(status_code=400, detail="No user message found.")
+
+    query = (last_user.get("content") or "").strip()
+    context = query_similar(query, top_k=8)
+    answer = generate_chat_answer(messages, context)
+    images = []
+    metadatas = (context.get("metadatas") or [[]])[0]
+    document_ids = [m.get("document_id") for m in metadatas if m]
+    if document_ids:
+        image_context = query_images_for_document(query, document_ids[0], limit=5)
+        image_docs = (image_context.get("documents") or [[]])[0]
+        image_metas = (image_context.get("metadatas") or [[]])[0]
+        for doc, meta in zip(image_docs, image_metas):
+            meta = meta or {}
+            context_snippet = ""
+            page = meta.get("page")
+            if page is not None:
+                page_context = get_text_for_page(document_ids[0], page, limit=1)
+                page_docs = page_context.get("documents") or []
+                page_docs = page_docs[0] if page_docs and isinstance(page_docs[0], list) else page_docs
+                if page_docs:
+                    context_snippet = page_docs[0][:400]
+            image_path = meta.get("path")
+            images.append({
+                "path": image_path,
+                "url": _build_file_url(request, image_path),
                 "caption": meta.get("caption") or doc or "Image",
                 "ocr": meta.get("ocr") or "",
                 "context": context_snippet,
@@ -163,7 +223,7 @@ async def notes_summary(payload: dict):
     return summarize_text_levels(text)
 
 @app.post("/generate_video/{document_id}")
-async def generate_video(document_id: str):
+async def generate_video(document_id: str, request: Request):
 
     text_chunks = get_chunks_for_document(document_id)
     raw_images = get_images_for_document(document_id)
@@ -215,6 +275,21 @@ async def generate_video(document_id: str):
 
     return {
         "message": "Video generated successfully",
-        "video_path": final_video
+        "video_path": final_video,
+        "video_url": _build_file_url(request, final_video)
         # "slides": slides
     }
+
+
+def _build_file_url(request: Request, file_path: str) -> str | None:
+    if not file_path:
+        return None
+
+    abs_path = os.path.abspath(file_path)
+    for base_dir, url_prefix in ("media", "media"), ("storage", "storage"):
+        base_abs = os.path.abspath(base_dir)
+        if abs_path.startswith(base_abs + os.sep):
+            rel_path = os.path.relpath(abs_path, base_abs)
+            rel_path = rel_path.replace(os.sep, "/")
+            return str(request.base_url)[:-1] + f"/{url_prefix}/{rel_path}"
+    return None
